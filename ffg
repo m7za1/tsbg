@@ -4,6 +4,7 @@ local UIS = game:GetService("UserInputService")
 local Stats = game:GetService("Stats")
 local TweenService = game:GetService("TweenService")
 local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 while not player do
@@ -17,27 +18,40 @@ if env.SolitudeTech and env.SolitudeTech.destroy then
     pcall(env.SolitudeTech.destroy)
 end
 
+-- ============================================================
+-- Config
+-- ============================================================
+
 local Config = {
     Enabled = true,
     UppercutAnimId = "10503381238",
-    RequireM1 = false,
     DebugAnimIds = false,
+
+    -- timing (shown in the menu)
+    DashCooldown = 4.9,
+    DashDelay = 0,
     JumpDelay = 0.30,
     JumpVelocity = 55,
 
+    -- aim (shown in the menu)
+    Shape = "P",
+    ShapeScale = 1.0,
+    Lead = 0.3,
+
+    -- hidden
     HeightLock = true,
     HeightOffset = 1,
     HeightLerp = 0.6,
 
-    ShapeScale = 1.0,
     WidthScale = 1.5,
     TargetAt = 0.55,
     MinStem = 12,
     ReachRadius = 1.0,
     TurnLerp = 0.5,
-    Lead = 0.3,
 
-    MultiDash = false,
+    TrackTarget = true,
+    TrackLerp = 0.5,
+
     HomeAfter = false,
     LegLerp = 1,
     HitDistance = 2.5,
@@ -46,8 +60,11 @@ local Config = {
     MaxTime = 1.6,
 
     Noclip = true,
-    NoclipRange = 12,
+    NoclipRange = 3,
     CamSmooth = true,
+
+    CancelOnDamage = true,
+    CancelOnStun = true,
 }
 
 local Defaults = {}
@@ -55,25 +72,138 @@ for key, value in pairs(Config) do
     Defaults[key] = value
 end
 
-local pShape = {
-    {-0.02, 0.25, "W"}, {-0.04, 0.50, "W"}, {-0.05, 0.75, "W"}, {-0.04, 0.90, "W"},
-    {-0.01, 0.99, "D"}, {0.09, 1.00, "D"}, {0.21, 0.95, "D"}, {0.26, 0.86, "D"}, {0.27, 0.77, "D"},
-    {0.25, 0.68, "S"}, {0.14, 0.58, "S"}, {0.07, 0.48, "S"}, {0.05, 0.34, "S"},
-    {0.04, 0.21, "S"}, {0.07, 0.12, "S"}, {0.10, 0.05, "S"}, {0.15, 0.02, "S"},
+local Limits = {
+    DashCooldown = {0, 60},
+    DashDelay = {0, 2},
+    JumpDelay = {0, 2},
+    JumpVelocity = {0, 200},
+    Lead = {0, 1},
+    ShapeScale = {0.2, 5},
 }
 
-local dashKeys = {
-    W = Enum.KeyCode.W,
-    D = Enum.KeyCode.D,
-    S = Enum.KeyCode.S,
+-- {sideways, forward}; forward 1.0 = end of the stem, target sits at Config.TargetAt
+local Shapes = {
+    P = {
+        {-0.02, 0.25}, {-0.04, 0.50}, {-0.05, 0.75}, {-0.04, 0.90},
+        {-0.01, 0.99}, {0.09, 1.00}, {0.21, 0.95}, {0.26, 0.86}, {0.27, 0.77},
+        {0.25, 0.68}, {0.14, 0.58}, {0.07, 0.48}, {0.05, 0.34},
+        {0.04, 0.21}, {0.07, 0.12}, {0.10, 0.05}, {0.15, 0.02},
+    },
+    R = {
+        {-0.02, 0.25}, {-0.04, 0.50}, {-0.05, 0.75}, {-0.04, 0.90},
+        {-0.01, 0.99}, {0.09, 1.00}, {0.21, 0.95}, {0.26, 0.86}, {0.27, 0.77},
+        {0.25, 0.68}, {0.14, 0.58}, {0.07, 0.49},
+        {0.12, 0.40}, {0.18, 0.31}, {0.23, 0.22}, {0.28, 0.13}, {0.33, 0.04},
+    },
 }
+
+local TuneKeys = {"DashCooldown", "DashDelay", "JumpDelay", "JumpVelocity", "Lead", "Shape", "ShapeScale"}
+
+-- ============================================================
+-- Files: autosave + presets
+-- ============================================================
+
+local Root = "techinified"
+local Folder = Root .. "/solitudetech"
+local ConfigFolder = Folder .. "/configs"
+local AutosavePath = Folder .. "/autosave.json"
+
+local hasFiles = typeof(writefile) == "function"
+    and typeof(readfile) == "function"
+    and typeof(isfile) == "function"
+
+local function clampKey(key, value)
+    local limit = Limits[key]
+    if limit then
+        return math.clamp(value, limit[1], limit[2])
+    end
+    return value
+end
+
+local function ensureFolders()
+    if typeof(makefolder) ~= "function" then return end
+    for _, path in ipairs({Root, Folder, ConfigFolder}) do
+        local found = false
+        if typeof(isfolder) == "function" then
+            local ok, result = pcall(isfolder, path)
+            found = ok and result == true
+        end
+        if not found then
+            pcall(makefolder, path)
+        end
+    end
+end
+
+local function writeJson(path, data)
+    if not hasFiles then return false end
+    ensureFolders()
+    local ok = pcall(function()
+        writefile(path, HttpService:JSONEncode(data))
+    end)
+    return ok
+end
+
+local function readJson(path)
+    if not hasFiles then return nil end
+    local ok, raw = pcall(function()
+        if not isfile(path) then return nil end
+        return readfile(path)
+    end)
+    if not ok or type(raw) ~= "string" then return nil end
+    local decodedOk, decoded = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+    if decodedOk and type(decoded) == "table" then
+        return decoded
+    end
+    return nil
+end
+
+local function sanitize(data, withEnabled)
+    local out = {}
+    if type(data) ~= "table" then return out end
+    for _, key in ipairs(TuneKeys) do
+        local value = data[key]
+        if key == "Shape" then
+            if type(value) == "string" and Shapes[value] then
+                out[key] = value
+            end
+        elseif type(value) == "number" and value == value and math.abs(value) ~= math.huge then
+            out[key] = clampKey(key, value)
+        end
+    end
+    if withEnabled and type(data.Enabled) == "boolean" then
+        out.Enabled = data.Enabled
+    end
+    return out
+end
+
+local function snapshot(withEnabled)
+    local data = {}
+    for _, key in ipairs(TuneKeys) do
+        data[key] = Config[key]
+    end
+    if withEnabled then
+        data.Enabled = Config.Enabled
+    end
+    return data
+end
+
+for key, value in pairs(sanitize(readJson(AutosavePath), true)) do
+    Config[key] = value
+end
+
+-- ============================================================
+-- Logic
+-- ============================================================
 
 local conns = {}
 local animConn, diedConn, steerConn
 local runId, busy, destroyed = 0, false, false
 local camAttached, prevSubject = false, nil
 local noclipped = {}
-local m1Count, lastM1 = 0, 0
+local lastRun = -math.huge
+local pingCache, pingAt = 0.05, -math.huge
 
 local function bind(signal, fn)
     local c = signal:Connect(fn)
@@ -92,14 +222,13 @@ local function unitOr(v, fallback)
     return fallback
 end
 
-local function fireDash(tag)
+local function fireDash()
     local char = player.Character
     local communicate = char and char:FindFirstChild("Communicate")
-    local key = dashKeys[tag or "W"]
-    if not communicate or not key then return end
+    if not communicate then return end
     pcall(function()
         communicate:FireServer({
-            Dash = key,
+            Dash = Enum.KeyCode.W,
             Key = Enum.KeyCode.Q,
             Goal = "KeyPress",
         })
@@ -107,11 +236,20 @@ local function fireDash(tag)
 end
 
 local function getPing()
+    local now = os.clock()
+    if now - pingAt < 0.25 then
+        return pingCache
+    end
+    pingAt = now
     local ok, ms = pcall(function()
         return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
     end)
-    if not ok or type(ms) ~= "number" then return 0.05 end
-    return math.clamp(ms / 1000, 0, 0.25)
+    if ok and type(ms) == "number" then
+        pingCache = math.clamp(ms / 1000, 0, 0.25)
+    else
+        pingCache = 0.05
+    end
+    return pingCache
 end
 
 local function predict(targetRoot, lead)
@@ -163,18 +301,17 @@ local function getNearestTorso(root)
     return best
 end
 
-local function buildP(origin, targetPos, facing)
+local function buildShape(origin, targetPos, facing)
     local toTarget = flat(targetPos - origin)
     local fwd = unitOr(toTarget, unitOr(flat(facing), Vector3.new(0, 0, -1)))
     local right = fwd:Cross(Vector3.yAxis)
     local s = math.max(toTarget.Magnitude / math.max(Config.TargetAt, 0.1), Config.MinStem) * Config.ShapeScale
+    local shape = Shapes[Config.Shape] or Shapes.P
+    local base = flat(origin)
 
     local pts = {}
-    for i, p in ipairs(pShape) do
-        pts[i] = {
-            pos = origin + fwd * (p[2] * s) + right * (p[1] * s * Config.WidthScale),
-            dash = p[3],
-        }
+    for i, p in ipairs(shape) do
+        pts[i] = base + fwd * (p[2] * s) + right * (p[1] * s * Config.WidthScale)
     end
     return pts
 end
@@ -249,6 +386,41 @@ local function restoreCollisions()
     end
 end
 
+local StunWords = {"stun", "ragdoll"}
+
+local function hasStunWord(name)
+    name = string.lower(name)
+    for _, word in ipairs(StunWords) do
+        if string.find(name, word, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function isStunned(char, hum)
+    if hum.PlatformStand then return true end
+    local state = hum:GetState()
+    if state == Enum.HumanoidStateType.Ragdoll or state == Enum.HumanoidStateType.FallingDown then
+        return true
+    end
+    for name, value in pairs(char:GetAttributes()) do
+        if value ~= false and value ~= 0 and value ~= nil and hasStunWord(name) then
+            return true
+        end
+    end
+    for _, child in ipairs(char:GetChildren()) do
+        if hasStunWord(child.Name) then
+            if child:IsA("BoolValue") then
+                if child.Value then return true end
+            elseif not child:IsA("BasePart") and not child:IsA("Accessory") then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 bind(RunService.Stepped, function()
     if not busy or not Config.Noclip then return end
     local char = player.Character
@@ -287,7 +459,7 @@ end
 
 local function execute()
     if busy or not Config.Enabled then return end
-    if Config.RequireM1 and m1Count < 3 then return end
+    if os.clock() - lastRun < Config.DashCooldown then return end
 
     local char = player.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
@@ -295,17 +467,43 @@ local function execute()
     if not root or not hum or hum.Health <= 0 then return end
     if not getTarget(root) then return end
 
-    m1Count = 0
     busy = true
     runId = runId + 1
     local id = runId
 
+    -- cancel when we take damage or get stunned during the run
+    local lastHealth = hum.Health
+    local watchStun = Config.CancelOnStun and not isStunned(char, hum)
+    local function interrupted()
+        local health = hum.Health
+        if Config.CancelOnDamage and health < lastHealth - 0.01 then
+            return true
+        end
+        lastHealth = health
+        return watchStun and isStunned(char, hum)
+    end
+
     task.spawn(function()
         task.wait(Config.JumpDelay)
         if id ~= runId then return end
-        if not root.Parent or hum.Health <= 0 then
+        if not root.Parent or hum.Health <= 0 or interrupted() then
             stop(false)
             return
+        end
+
+        -- jump; with Height lock and no dash delay the lock would override it at once
+        if Config.DashDelay > 0 or not Config.HeightLock then
+            local v = root.AssemblyLinearVelocity
+            root.AssemblyLinearVelocity = Vector3.new(v.X, Config.JumpVelocity, v.Z)
+        end
+
+        if Config.DashDelay > 0 then
+            task.wait(Config.DashDelay)
+            if id ~= runId then return end
+            if not root.Parent or hum.Health <= 0 or interrupted() then
+                stop(false)
+                return
+            end
         end
 
         local targetRoot = getTarget(root)
@@ -314,30 +512,35 @@ local function execute()
             return
         end
 
-        local origin = root.Position
-        local pts = buildP(origin, predict(targetRoot, Config.Lead), root.CFrame.LookVector)
+        lastRun = os.clock()
 
+        local origin = root.Position
+        local targetPos = predict(targetRoot, Config.Lead)
+        local pts = buildShape(origin, targetPos, root.CFrame.LookVector)
+
+        -- the shape is stored relative to the target so it can follow it
+        local targetFlat = flat(targetPos)
+        local rel = {}
         local segDirs = {}
+        local prev = flat(origin)
         for i = 1, #pts do
-            local prev = (i == 1) and origin or pts[i - 1].pos
-            segDirs[i] = unitOr(flat(pts[i].pos - prev), Vector3.new(0, 0, -1))
+            rel[i] = pts[i] - targetFlat
+            segDirs[i] = unitOr(pts[i] - prev, Vector3.new(0, 0, -1))
+            prev = pts[i]
         end
 
+        local center = targetFlat
         local idx = 1
         local lastDir = segDirs[1]
-        local lastTag = "W"
         local t0 = os.clock()
+        local nextCheck = 0
 
         local lastTorso = getTorso(targetRoot.Parent)
 
-        if not Config.HeightLock then
-            local v = root.AssemblyLinearVelocity
-            root.AssemblyLinearVelocity = Vector3.new(v.X, Config.JumpVelocity, v.Z)
-        end
         hum.AutoRotate = false
         attachCamera(root)
 
-        fireDash("W")
+        fireDash()
 
         steerConn = RunService.Heartbeat:Connect(function(dt)
             if id ~= runId then return end
@@ -345,14 +548,30 @@ local function execute()
                 stop(false)
                 return
             end
-            if os.clock() - t0 > Config.MaxTime then
+
+            local now = os.clock()
+            if now - t0 > Config.MaxTime then
                 stop(false)
                 return
             end
+            if now >= nextCheck then
+                nextCheck = now + 0.05
+                if interrupted() then
+                    stop(false)
+                    return
+                end
+            end
+
+            if Config.TrackTarget then
+                local want = flat(predict(targetRoot, Config.Lead))
+                local trackAlpha = 1 - (1 - math.clamp(Config.TrackLerp, 0, 1)) ^ (math.min(dt, 0.1) * 60)
+                center = center:Lerp(want, trackAlpha)
+            end
 
             local rootPos = root.Position
+            local rootFlat = flat(rootPos)
             while idx <= #pts do
-                local to = flat(pts[idx].pos - rootPos)
+                local to = center + rel[idx] - rootFlat
                 if to.Magnitude < Config.ReachRadius or to:Dot(segDirs[idx]) < 0 then
                     idx = idx + 1
                 else
@@ -362,16 +581,10 @@ local function execute()
 
             local dir, lerp
             if idx <= #pts then
-                dir = unitOr(flat(pts[idx].pos - rootPos), lastDir)
+                dir = unitOr(center + rel[idx] - rootFlat, lastDir)
                 lerp = Config.TurnLerp
-
-                local tag = pts[idx].dash
-                if Config.MultiDash and tag ~= lastTag then
-                    lastTag = tag
-                    fireDash(tag)
-                end
             elseif Config.HomeAfter then
-                local to = flat(predict(targetRoot, 0.1) - rootPos)
+                local to = flat(predict(targetRoot, 0.1)) - rootFlat
                 if to.Magnitude < Config.HitDistance then
                     stop(true)
                     return
@@ -440,16 +653,6 @@ bind(player.CharacterAdded, hookCharacter)
 if player.Character then
     task.spawn(hookCharacter, player.Character)
 end
-
-bind(UIS.InputBegan, function(input, gpe)
-    if gpe then return end
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        local now = os.clock()
-        if now - lastM1 > 1.2 then m1Count = 0 end
-        m1Count = m1Count + 1
-        lastM1 = now
-    end
-end)
 
 -- ============================================================
 -- UI (glass sidebar style, same as FixLag)
@@ -780,11 +983,12 @@ end
 
 function Page:AddNumber(options)
     local callback = options.Callback or function() end
+    local minValue, maxValue = options.Min, options.Max
     local value = options.Default or 0
     local row = newRow(self, 40)
 
     label({
-        Size = UDim2.new(1, -112, 1, 0),
+        Size = UDim2.new(1, -124, 1, 0),
         Position = UDim2.fromOffset(12, 0),
         Text = options.Name,
         TextTruncate = Enum.TextTruncate.AtEnd,
@@ -793,8 +997,8 @@ function Page:AddNumber(options)
 
     local boxStroke = stroke(0.85)
     local box = create("TextBox", {
-        Size = UDim2.fromOffset(84, 26),
-        Position = UDim2.new(1, -96, 0.5, -13),
+        Size = UDim2.fromOffset(92, 30),
+        Position = UDim2.new(1, -104, 0.5, -15),
         BackgroundColor3 = Theme.RowColor,
         BackgroundTransparency = Theme.RowTransparency,
         BorderSizePixel = 0,
@@ -807,14 +1011,20 @@ function Page:AddNumber(options)
         Parent = row,
     }, {corner(0, Theme.RowCorner), boxStroke})
 
+    local function clampValue(n)
+        if minValue then n = math.max(minValue, n) end
+        if maxValue then n = math.min(maxValue, n) end
+        return n
+    end
+
     self.Track(box.Focused:Connect(function()
         animate(boxStroke, {Color = Theme.Accent, Transparency = 0.3}, true)
     end))
     self.Track(box.FocusLost:Connect(function()
         animate(boxStroke, {Color = Theme.StrokeColor, Transparency = 0.85}, true)
-        local n = tonumber(box.Text)
+        local n = tonumber((string.gsub(box.Text, ",", ".")))
         if n and n == n and math.abs(n) ~= math.huge then
-            value = n
+            value = clampValue(n)
             task.spawn(callback, value)
         end
         box.Text = formatNumber(value)
@@ -825,11 +1035,90 @@ function Page:AddNumber(options)
         return value
     end
     function control:Set(newValue)
-        value = newValue
+        value = clampValue(newValue)
         box.Text = formatNumber(value)
         task.spawn(callback, value)
     end
     return control
+end
+
+function Page:AddChoice(options)
+    local callback = options.Callback or function() end
+    local choices = options.Choices
+    local index = table.find(choices, options.Default) or 1
+    local row = newRow(self, 40)
+
+    label({
+        Size = UDim2.new(1, -124, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        Text = options.Name,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Parent = row,
+    })
+
+    local button = create("TextButton", {
+        Size = UDim2.fromOffset(92, 30),
+        Position = UDim2.new(1, -104, 0.5, -15),
+        BackgroundColor3 = Theme.RowColor,
+        BackgroundTransparency = Theme.RowTransparency,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Font = Theme.FontBold,
+        Text = choices[index],
+        TextSize = 14,
+        TextColor3 = Theme.Accent,
+        Parent = row,
+    }, {corner(0, Theme.RowCorner), stroke(0.85)})
+
+    local control = {}
+    function control:Get()
+        return choices[index]
+    end
+    function control:Set(choice)
+        local found = table.find(choices, choice)
+        if not found then
+            return
+        end
+        index = found
+        button.Text = choices[index]
+        task.spawn(callback, choices[index])
+    end
+    self.Track(button.Activated:Connect(function()
+        index = index % #choices + 1
+        button.Text = choices[index]
+        task.spawn(callback, choices[index])
+    end))
+    return control
+end
+
+function Page:AddTextInput(options)
+    local row = newRow(self, 40)
+    local inputStroke = stroke(0.85)
+    local box = create("TextBox", {
+        Size = UDim2.new(1, -20, 0, 30),
+        Position = UDim2.new(0, 10, 0.5, -15),
+        BackgroundColor3 = Theme.RowColor,
+        BackgroundTransparency = Theme.RowTransparency,
+        BorderSizePixel = 0,
+        ClearTextOnFocus = false,
+        ClipsDescendants = true,
+        Font = Theme.Font,
+        Text = options.Text or "",
+        PlaceholderText = options.Placeholder or "",
+        PlaceholderColor3 = Theme.TextMuted,
+        TextColor3 = Theme.Text,
+        TextSize = 13,
+        Parent = row,
+    }, {corner(0, Theme.RowCorner), inputStroke})
+
+    self.Track(box.Focused:Connect(function()
+        animate(inputStroke, {Color = Theme.Accent, Transparency = 0.3}, true)
+    end))
+    self.Track(box.FocusLost:Connect(function()
+        animate(inputStroke, {Color = Theme.StrokeColor, Transparency = 0.85}, true)
+    end))
+
+    return {Box = box}
 end
 
 function Page:AddSection(title)
@@ -898,6 +1187,138 @@ function Page:AddButton(options)
     function control:SetText(text)
         button.Text = text
     end
+    return control
+end
+
+function Page:AddButtonRow(buttons)
+    self.Order = self.Order + 1
+    local count = #buttons
+    local gap = 6
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 38),
+        BackgroundTransparency = 1,
+        LayoutOrder = self.Order,
+        Parent = self.Scroll,
+    }, {
+        create("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            Padding = UDim.new(0, gap),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }),
+    })
+
+    local controls = {}
+    for index, options in ipairs(buttons) do
+        local callback = options.Callback or function() end
+        local background, textColor = Theme.Accent, Theme.OnAccent
+        if options.Style == "danger" then
+            background, textColor = Theme.Danger, Theme.OnDanger
+        elseif options.Style == "neutral" then
+            background, textColor = Theme.SwitchOff, Theme.Text
+        end
+
+        local button = create("TextButton", {
+            Size = UDim2.new(1 / count, -gap * (count - 1) / count, 1, 0),
+            BackgroundColor3 = background,
+            BorderSizePixel = 0,
+            AutoButtonColor = false,
+            Font = Theme.Font,
+            Text = options.Name,
+            TextSize = 14,
+            TextColor3 = textColor,
+            LayoutOrder = index,
+            Parent = row,
+        }, {corner(0, Theme.RowCorner)})
+
+        local function release()
+            animate(button, {BackgroundTransparency = 0}, true)
+        end
+        self.Track(button.MouseButton1Down:Connect(function()
+            animate(button, {BackgroundTransparency = 0.25}, true)
+        end))
+        self.Track(button.MouseButton1Up:Connect(release))
+        self.Track(button.MouseLeave:Connect(release))
+        self.Track(button.Activated:Connect(function()
+            task.spawn(callback)
+        end))
+
+        local control = {Button = button}
+        function control:SetText(text)
+            button.Text = text
+        end
+        controls[index] = control
+    end
+
+    return controls
+end
+
+function Page:AddList(options)
+    local onSelect = options.OnSelect or function() end
+    self.Order = self.Order + 1
+    local container = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 1,
+        LayoutOrder = self.Order,
+        Parent = self.Scroll,
+    }, {
+        create("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}),
+    })
+
+    local entries = {}
+    local emptyLabel
+    local control = {}
+
+    function control:SetItems(names, selected)
+        for _, entry in ipairs(entries) do
+            entry.Connection:Disconnect()
+            entry.Button:Destroy()
+        end
+        entries = {}
+        if emptyLabel then
+            emptyLabel:Destroy()
+            emptyLabel = nil
+        end
+
+        if #names == 0 then
+            emptyLabel = label({
+                Size = UDim2.new(1, 0, 0, 28),
+                Text = "No saved presets",
+                TextSize = 12,
+                TextColor3 = Theme.TextMuted,
+                Parent = container,
+            })
+            create("UIPadding", {PaddingLeft = UDim.new(0, 4), Parent = emptyLabel})
+            return
+        end
+
+        for index, name in ipairs(names) do
+            local isSelected = name == selected
+            local button = create("TextButton", {
+                Size = UDim2.new(1, 0, 0, 36),
+                BackgroundColor3 = isSelected and Theme.Accent or Theme.RowColor,
+                BackgroundTransparency = isSelected and 0.78 or Theme.RowTransparency,
+                BorderSizePixel = 0,
+                AutoButtonColor = false,
+                Font = Theme.Font,
+                Text = name,
+                TextSize = 14,
+                TextColor3 = isSelected and Theme.Accent or Theme.Text,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                LayoutOrder = index,
+                Parent = container,
+            }, {
+                corner(0, Theme.RowCorner),
+                create("UIPadding", {PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12)}),
+            })
+            local connection = button.Activated:Connect(function()
+                onSelect(name)
+            end)
+            entries[#entries + 1] = {Button = button, Connection = connection}
+        end
+    end
+
     return control
 end
 
@@ -1246,77 +1667,258 @@ local window = GlassUI.new({
 })
 
 local controls = {}
-local numberBoxes = {}
+local controlsByKey = {}
+local textBoxes = {}
 
-local function addToggle(page, name, key, description, onChange)
-    local control = page:AddToggle({
+local saveQueued = false
+local function queueAutosave()
+    if saveQueued or destroyed then
+        return
+    end
+    saveQueued = true
+    task.delay(0.6, function()
+        saveQueued = false
+        if not destroyed then
+            writeJson(AutosavePath, snapshot(true))
+        end
+    end)
+end
+
+local function register(key, control)
+    controls[#controls + 1] = {Key = key, Control = control}
+    controlsByKey[key] = control
+end
+
+local function addToggle(page, name, key, onChange)
+    register(key, page:AddToggle({
         Name = name,
-        Description = description,
         Default = Config[key],
         Callback = function(enabled)
             Config[key] = enabled
             if onChange then
                 onChange(enabled)
             end
+            queueAutosave()
         end,
-    })
-    controls[#controls + 1] = {Key = key, Control = control}
+    }))
 end
 
 local function addNumber(page, name, key)
+    local limit = Limits[key]
     local control = page:AddNumber({
         Name = name,
         Default = Config[key],
+        Min = limit and limit[1],
+        Max = limit and limit[2],
         Callback = function(value)
             Config[key] = value
+            queueAutosave()
         end,
     })
-    controls[#controls + 1] = {Key = key, Control = control}
-    numberBoxes[#numberBoxes + 1] = control.Box
+    register(key, control)
+    textBoxes[#textBoxes + 1] = control.Box
+end
+
+local function addChoice(page, name, key, choices)
+    register(key, page:AddChoice({
+        Name = name,
+        Choices = choices,
+        Default = Config[key],
+        Callback = function(choice)
+            Config[key] = choice
+            queueAutosave()
+        end,
+    }))
 end
 
 window:OnVisibility(function(visible)
     if not visible then
-        for _, box in ipairs(numberBoxes) do
+        for _, box in ipairs(textBoxes) do
             box:ReleaseFocus()
         end
     end
 end)
 
+-- Main
 local main = window:AddTab({Name = "Main"})
 main:AddSection("Tech")
-addToggle(main, "Enabled", "Enabled", "Auto-dash after uppercut", function(enabled)
+addToggle(main, "Solitude tech", "Enabled", function(enabled)
     if not enabled then
         stop(false)
     end
 end)
-addToggle(main, "Require 3 M1", "RequireM1", "Only after three M1 hits")
-addToggle(main, "Multi dash W-D-S", "MultiDash", "Dash on every P segment")
-addToggle(main, "Home after P", "HomeAfter", "Chase the target after the P")
-main:AddSection("Movement")
-addToggle(main, "Height lock", "HeightLock", "Hold height at the target torso")
-addToggle(main, "Noclip", "Noclip", "Pass through nearby players")
-addToggle(main, "Camera smooth", "CamSmooth", "Attach the camera during the dash")
-main:AddSection("Debug")
-addToggle(main, "Debug anim ids", "DebugAnimIds", "Print animation ids to the console")
+main:AddSection("Timing")
+addNumber(main, "dashCooldown", "DashCooldown")
+addNumber(main, "dashDelay", "DashDelay")
+addNumber(main, "jumpDelay", "JumpDelay")
+addNumber(main, "jumpForce", "JumpVelocity")
+main:AddSection("Aim")
+addChoice(main, "shape", "Shape", {"P", "R"})
+addNumber(main, "P Scale", "ShapeScale")
+addNumber(main, "lead", "Lead")
 
-local tuning = window:AddTab({Name = "Tuning", Icon = "T"})
-tuning:AddSection("Timing")
-addNumber(tuning, "Jump delay (s)", "JumpDelay")
-addNumber(tuning, "Jump velocity", "JumpVelocity")
-addNumber(tuning, "Max time (s)", "MaxTime")
-tuning:AddSection("Height")
-addNumber(tuning, "Height offset", "HeightOffset")
-addNumber(tuning, "Height lerp", "HeightLerp")
-tuning:AddSection("P shape")
-addNumber(tuning, "P scale", "ShapeScale")
-addNumber(tuning, "P width", "WidthScale")
-addNumber(tuning, "Target at (0-1)", "TargetAt")
-addNumber(tuning, "Reach radius", "ReachRadius")
-addNumber(tuning, "Turn lerp", "TurnLerp")
-tuning:AddSection("Targeting")
-addNumber(tuning, "Target range", "TargetRange")
+-- Configs
+local function cleanName(text)
+    text = string.gsub(text, "[^%w_%- ]", "")
+    text = string.gsub(text, "^%s+", "")
+    text = string.gsub(text, "%s+$", "")
+    return string.sub(text, 1, 32)
+end
 
+local function configPath(name)
+    return ConfigFolder .. "/" .. name .. ".json"
+end
+
+local function listConfigs()
+    local names = {}
+    if typeof(listfiles) ~= "function" then
+        return names
+    end
+    local ok, files = pcall(listfiles, ConfigFolder)
+    if not ok or type(files) ~= "table" then
+        return names
+    end
+    for _, path in ipairs(files) do
+        local name = string.match(path, "([^/\\]+)%.json$")
+        if name then
+            table.insert(names, name)
+        end
+    end
+    table.sort(names, function(a, b)
+        return string.lower(a) < string.lower(b)
+    end)
+    return names
+end
+
+local configsPage = window:AddTab({Name = "Configs", Icon = "C"})
+configsPage:AddSection("Presets")
+local nameInput = configsPage:AddTextInput({Placeholder = "Config name"})
+textBoxes[#textBoxes + 1] = nameInput.Box
+local status = configsPage:AddLabel({
+    Text = hasFiles and "Pick a preset or type a name" or "Executor has no file access",
+})
+
+local selectedConfig
+local configNames = {}
+local configList
+local configButtons
+local deleteArmed = false
+local deleteToken = 0
+
+local function setStatus(text)
+    status:SetText(text)
+end
+
+local function refreshList()
+    configNames = listConfigs()
+    configList:SetItems(configNames, selectedConfig)
+end
+
+local function currentName()
+    local name = cleanName(nameInput.Box.Text)
+    if name == "" then
+        name = selectedConfig or ""
+    end
+    return name
+end
+
+configButtons = configsPage:AddButtonRow({
+    {Name = "Save", Callback = function()
+        if not hasFiles then
+            setStatus("Executor has no file access")
+            return
+        end
+        local name = cleanName(nameInput.Box.Text)
+        if name == "" then
+            setStatus("Enter a name first")
+            return
+        end
+        if writeJson(configPath(name), snapshot(false)) then
+            selectedConfig = name
+            nameInput.Box.Text = name
+            setStatus("Saved: " .. name)
+            refreshList()
+        else
+            setStatus("Could not save the file")
+        end
+    end},
+    {Name = "Load", Style = "neutral", Callback = function()
+        if not hasFiles then
+            setStatus("Executor has no file access")
+            return
+        end
+        local name = currentName()
+        if name == "" then
+            setStatus("Pick a preset first")
+            return
+        end
+        local data = readJson(configPath(name))
+        if not data then
+            setStatus("Config not found: " .. name)
+            return
+        end
+        for key, value in pairs(sanitize(data, false)) do
+            local control = controlsByKey[key]
+            if control then
+                control:Set(value)
+            end
+        end
+        selectedConfig = name
+        nameInput.Box.Text = name
+        setStatus("Loaded: " .. name)
+        refreshList()
+    end},
+    {Name = "Delete", Style = "danger", Callback = function()
+        local name = currentName()
+        if name == "" then
+            setStatus("Pick a preset first")
+            return
+        end
+
+        deleteToken = deleteToken + 1
+        if not deleteArmed then
+            deleteArmed = true
+            configButtons[3]:SetText("Tap again")
+            local token = deleteToken
+            task.delay(ConfirmTimeout, function()
+                if token == deleteToken and deleteArmed and not destroyed then
+                    deleteArmed = false
+                    configButtons[3]:SetText("Delete")
+                end
+            end)
+            return
+        end
+
+        deleteArmed = false
+        configButtons[3]:SetText("Delete")
+        if typeof(delfile) ~= "function" then
+            setStatus("Executor can't delete files")
+            return
+        end
+        local ok = pcall(delfile, configPath(name))
+        if ok then
+            if selectedConfig == name then
+                selectedConfig = nil
+            end
+            setStatus("Deleted: " .. name)
+            refreshList()
+        else
+            setStatus("Could not delete: " .. name)
+        end
+    end},
+})
+
+configsPage:AddSection("Saved")
+configList = configsPage:AddList({
+    OnSelect = function(name)
+        selectedConfig = name
+        nameInput.Box.Text = name
+        configList:SetItems(configNames, selectedConfig)
+    end,
+})
+refreshList()
+
+-- Settings
 local function resetToDefaults()
     for _, entry in ipairs(controls) do
         local default = Defaults[entry.Key]
@@ -1328,8 +1930,8 @@ end
 
 local settingsPage = window:AddTab({Name = "Settings"})
 settingsPage:AddLabel({Text = "Solitude Tech  \u{B7}  by " .. Theme.Author})
+settingsPage:AddLabel({Text = "Settings are saved automatically"})
 settingsPage:AddLabel({Text = "Open: swipe right from the left screen edge"})
-settingsPage:AddLabel({Text = "PC: RightShift shows or hides the menu"})
 settingsPage:AddButton({Name = "Hide menu", Callback = function()
     window:SetVisible(false)
 end})
@@ -1393,6 +1995,7 @@ local function destroy()
         return
     end
     destroyed = true
+    writeJson(AutosavePath, snapshot(true))
     stop(false)
     if animConn then animConn:Disconnect() animConn = nil end
     if diedConn then diedConn:Disconnect() diedConn = nil end
