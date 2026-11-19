@@ -1,10 +1,20 @@
+local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
 local Stats = game:GetService("Stats")
-local player = game:GetService("Players").LocalPlayer
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
 
-if getgenv().SolitudeTech and getgenv().SolitudeTech.destroy then
-    pcall(getgenv().SolitudeTech.destroy)
+local player = Players.LocalPlayer
+while not player do
+    task.wait()
+    player = Players.LocalPlayer
+end
+
+local env = (getgenv and getgenv()) or _G
+
+if env.SolitudeTech and env.SolitudeTech.destroy then
+    pcall(env.SolitudeTech.destroy)
 end
 
 local Config = {
@@ -14,6 +24,10 @@ local Config = {
     DebugAnimIds = false,
     JumpDelay = 0.30,
     JumpVelocity = 55,
+
+    HeightLock = true,
+    HeightOffset = 1,
+    HeightLerp = 0.6,
 
     ShapeScale = 1.0,
     WidthScale = 1.5,
@@ -35,6 +49,11 @@ local Config = {
     NoclipRange = 12,
     CamSmooth = true,
 }
+
+local Defaults = {}
+for key, value in pairs(Config) do
+    Defaults[key] = value
+end
 
 local pShape = {
     {-0.02, 0.25, "W"}, {-0.04, 0.50, "W"}, {-0.05, 0.75, "W"}, {-0.04, 0.90, "W"},
@@ -119,6 +138,31 @@ local function getTarget(root)
     return best
 end
 
+local function getTorso(model)
+    return model:FindFirstChild("Torso")
+        or model:FindFirstChild("UpperTorso")
+        or model:FindFirstChild("HumanoidRootPart")
+end
+
+local function getNearestTorso(root)
+    local live = workspace:FindFirstChild("Live")
+    if not live then return nil end
+    local best, bestDist = nil, Config.TargetRange
+    for _, model in ipairs(live:GetChildren()) do
+        if model:IsA("Model") and model ~= player.Character then
+            local h = model:FindFirstChildOfClass("Humanoid")
+            local torso = getTorso(model)
+            if torso and h and h.Health > 0 then
+                local d = (torso.Position - root.Position).Magnitude
+                if d < bestDist then
+                    best, bestDist = torso, d
+                end
+            end
+        end
+    end
+    return best
+end
+
 local function buildP(origin, targetPos, facing)
     local toTarget = flat(targetPos - origin)
     local fwd = unitOr(toTarget, unitOr(flat(facing), Vector3.new(0, 0, -1)))
@@ -135,19 +179,19 @@ local function buildP(origin, targetPos, facing)
     return pts
 end
 
-local function redirect(root, dir)
+local function redirect(root, dir, holdY)
     for _, obj in ipairs(root:GetChildren()) do
         if obj:IsA("BodyVelocity") then
             local v = obj.Velocity
             local spd = Vector3.new(v.X, 0, v.Z).Magnitude
             if spd > 1 then
-                obj.Velocity = Vector3.new(dir.X * spd, v.Y, dir.Z * spd)
+                obj.Velocity = Vector3.new(dir.X * spd, holdY and 0 or v.Y, dir.Z * spd)
             end
         elseif obj:IsA("LinearVelocity") and obj.RelativeTo == Enum.ActuatorRelativeTo.World then
             local v = obj.VectorVelocity
             local spd = Vector3.new(v.X, 0, v.Z).Magnitude
             if spd > 1 then
-                obj.VectorVelocity = Vector3.new(dir.X * spd, v.Y, dir.Z * spd)
+                obj.VectorVelocity = Vector3.new(dir.X * spd, holdY and 0 or v.Y, dir.Z * spd)
             end
         end
     end
@@ -284,8 +328,12 @@ local function execute()
         local lastTag = "W"
         local t0 = os.clock()
 
-        local v = root.AssemblyLinearVelocity
-        root.AssemblyLinearVelocity = Vector3.new(v.X, Config.JumpVelocity, v.Z)
+        local lastTorso = getTorso(targetRoot.Parent)
+
+        if not Config.HeightLock then
+            local v = root.AssemblyLinearVelocity
+            root.AssemblyLinearVelocity = Vector3.new(v.X, Config.JumpVelocity, v.Z)
+        end
         hum.AutoRotate = false
         attachCamera(root)
 
@@ -338,8 +386,24 @@ local function execute()
 
             local alpha = 1 - (1 - math.clamp(lerp, 0, 1)) ^ (math.min(dt, 0.1) * 60)
             local goal = CFrame.lookAt(rootPos, rootPos + dir)
-            root.CFrame = root.CFrame:Lerp(goal, alpha)
-            redirect(root, unitOr(flat(root.CFrame.LookVector), dir))
+            local cf = root.CFrame:Lerp(goal, alpha)
+
+            local holdY = false
+            if Config.HeightLock then
+                local torso = getNearestTorso(root) or lastTorso
+                if torso and torso.Parent then
+                    lastTorso = torso
+                    holdY = true
+                    local goalY = torso.Position.Y + Config.HeightOffset
+                    local heightAlpha = 1 - (1 - math.clamp(Config.HeightLerp, 0, 1)) ^ (math.min(dt, 0.1) * 60)
+                    cf = cf + Vector3.new(0, (goalY - rootPos.Y) * heightAlpha, 0)
+                    local vel = root.AssemblyLinearVelocity
+                    root.AssemblyLinearVelocity = Vector3.new(vel.X, 0, vel.Z)
+                end
+            end
+
+            root.CFrame = cf
+            redirect(root, unitOr(flat(root.CFrame.LookVector), dir), holdY)
         end)
     end)
 end
@@ -387,181 +451,971 @@ bind(UIS.InputBegan, function(input, gpe)
     end
 end)
 
-local function make(class, props, parent)
-    local o = Instance.new(class)
-    for k, v in pairs(props) do o[k] = v end
-    o.Parent = parent
-    return o
-end
+-- ============================================================
+-- UI (glass sidebar style, same as FixLag)
+-- ============================================================
 
-local gui = make("ScreenGui", {Name = "SolitudeTechUI", ResetOnSpawn = false, DisplayOrder = 999})
-local okParent = pcall(function()
-    gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
-end)
-if not okParent or not gui.Parent then
-    gui.Parent = player:WaitForChild("PlayerGui")
-end
+local Theme = {
+    Font = Enum.Font.GothamMedium,
+    FontBold = Enum.Font.GothamBold,
+    WindowTransparency = 0.28,
+    SidebarTransparency = 0.45,
+    RowTransparency = 0.9,
+    StrokeTransparency = 0.72,
+    GlassTop     = Color3.fromRGB(78, 86, 130),
+    GlassBottom  = Color3.fromRGB(20, 24, 44),
+    SidebarColor = Color3.fromRGB(8, 10, 20),
+    RowColor     = Color3.fromRGB(255, 255, 255),
+    StrokeColor  = Color3.fromRGB(255, 255, 255),
+    Text         = Color3.fromRGB(238, 242, 255),
+    TextMuted    = Color3.fromRGB(150, 160, 188),
+    Accent       = Color3.fromRGB(45, 212, 191),
+    OnAccent     = Color3.fromRGB(4, 52, 44),
+    Danger       = Color3.fromRGB(240, 110, 110),
+    OnDanger     = Color3.fromRGB(58, 14, 20),
+    SwitchOff    = Color3.fromRGB(70, 78, 104),
+    Corner = 14,
+    RowCorner = 8,
+    ToggleKey = Enum.KeyCode.RightShift,
+    SwipeEdgeWidth = 32,
+    SwipeDistance = 64,
+    WindowMaxWidth = 480,
+    WindowMaxHeight = 340,
+    StickWidth = 4,
+    Author = "Techinified",
+}
 
-local ACCENT = Color3.fromRGB(135, 100, 255)
-local main = make("Frame", {
-    Size = UDim2.fromOffset(190, 62),
-    Position = UDim2.new(0.5, -95, 0.2, 0),
-    BackgroundColor3 = Color3.fromRGB(12, 12, 20),
-    BorderSizePixel = 0,
-    Active = true,
-}, gui)
-make("UICorner", {CornerRadius = UDim.new(0, 8)}, main)
-make("UIStroke", {Color = ACCENT, Thickness = 2}, main)
+local ConfirmText = "Are you sure you want to delete the script?"
+local ConfirmHint = "Press again to confirm."
+local ConfirmTimeout = 2
+local ToastShown = UDim2.new(0.5, 0, 1, -24)
+local ToastHidden = UDim2.new(0.5, 0, 1, 90)
 
-local header = make("Frame", {Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1}, main)
-make("TextLabel", {
-    Size = UDim2.new(1, -62, 1, 0),
-    Position = UDim2.fromOffset(8, 0),
-    BackgroundTransparency = 1,
-    Text = "SOLITUDE TECH · P",
-    TextColor3 = Color3.fromRGB(200, 185, 255),
-    Font = Enum.Font.GothamBold,
-    TextSize = 12,
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, header)
+local WindowShowTween = TweenInfo.new(0.5, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local WindowHideTween = TweenInfo.new(0.32, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+local SeedScale = 0.02
 
-local gearBtn = make("TextButton", {
-    Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -52, 0, 3),
-    BackgroundColor3 = Color3.fromRGB(40, 32, 90), BorderSizePixel = 0,
-    Text = "⚙", TextColor3 = Color3.new(1, 1, 1), TextSize = 14, Font = Enum.Font.GothamBold,
-}, header)
-make("UICorner", {CornerRadius = UDim.new(0, 5)}, gearBtn)
+local GlassUI = {}
+local Page = {}
+Page.__index = Page
 
-local closeBtn = make("TextButton", {
-    Size = UDim2.fromOffset(22, 22), Position = UDim2.new(1, -26, 0, 3),
-    BackgroundColor3 = Color3.fromRGB(150, 45, 60), BorderSizePixel = 0,
-    Text = "X", TextColor3 = Color3.new(1, 1, 1), TextSize = 12, Font = Enum.Font.GothamBold,
-}, header)
-make("UICorner", {CornerRadius = UDim.new(0, 5)}, closeBtn)
-
-local toggleBtn = make("TextButton", {
-    Size = UDim2.new(1, -16, 0, 24), Position = UDim2.fromOffset(8, 32),
-    BorderSizePixel = 0, TextColor3 = Color3.new(1, 1, 1),
-    TextSize = 12, Font = Enum.Font.GothamBold,
-}, main)
-make("UICorner", {CornerRadius = UDim.new(0, 5)}, toggleBtn)
-
-local function refreshToggle()
-    toggleBtn.Text = Config.Enabled and "● ON" or "● OFF"
-    toggleBtn.BackgroundColor3 = Config.Enabled and Color3.fromRGB(80, 55, 190) or Color3.fromRGB(55, 40, 90)
-end
-refreshToggle()
-
-local panel = make("ScrollingFrame", {
-    Size = UDim2.fromOffset(230, 230), Position = UDim2.new(0, 0, 1, 6),
-    BackgroundColor3 = Color3.fromRGB(10, 10, 22), BorderSizePixel = 0,
-    ScrollBarThickness = 4, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    Visible = false,
-}, main)
-make("UICorner", {CornerRadius = UDim.new(0, 8)}, panel)
-make("UIStroke", {Color = ACCENT, Thickness = 1.5}, panel)
-make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, panel)
-make("UIPadding", {PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6)}, panel)
-
-local function addNumber(label, key)
-    local row = make("Frame", {Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = Color3.fromRGB(20, 20, 40), BorderSizePixel = 0}, panel)
-    make("UICorner", {CornerRadius = UDim.new(0, 4)}, row)
-    make("TextLabel", {
-        Size = UDim2.new(0.6, 0, 1, 0), Position = UDim2.fromOffset(6, 0), BackgroundTransparency = 1,
-        Text = label, TextColor3 = Color3.fromRGB(220, 215, 245), TextSize = 11,
-        Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left,
-    }, row)
-    local box = make("TextBox", {
-        Size = UDim2.new(0.36, 0, 0, 20), Position = UDim2.new(0.62, 0, 0.5, -10),
-        BackgroundColor3 = Color3.fromRGB(38, 32, 75), BorderSizePixel = 0,
-        Text = tostring(Config[key]), TextColor3 = Color3.new(1, 1, 1), TextSize = 11,
-        Font = Enum.Font.Gotham, ClearTextOnFocus = false,
-    }, row)
-    make("UICorner", {CornerRadius = UDim.new(0, 4)}, box)
-    box.FocusLost:Connect(function()
-        local n = tonumber(box.Text)
-        if n and n == n then
-            Config[key] = n
+local function create(className, properties, children)
+    local instance = Instance.new(className)
+    local parent = properties.Parent
+    for name, value in pairs(properties) do
+        if name ~= "Parent" then
+            instance[name] = value
         end
-        box.Text = tostring(Config[key])
-    end)
-end
-
-local function addBool(label, key)
-    local btn = make("TextButton", {
-        Size = UDim2.new(1, 0, 0, 26), BorderSizePixel = 0,
-        TextColor3 = Color3.new(1, 1, 1), TextSize = 11, Font = Enum.Font.GothamMedium,
-    }, panel)
-    make("UICorner", {CornerRadius = UDim.new(0, 4)}, btn)
-    local function refresh()
-        btn.Text = label .. ": " .. (Config[key] and "ON" or "OFF")
-        btn.BackgroundColor3 = Config[key] and Color3.fromRGB(70, 50, 160) or Color3.fromRGB(35, 30, 60)
     end
-    refresh()
-    btn.MouseButton1Click:Connect(function()
-        Config[key] = not Config[key]
-        refresh()
-    end)
+    for _, child in ipairs(children or {}) do
+        child.Parent = instance
+    end
+    if parent then
+        instance.Parent = parent
+    end
+    return instance
 end
 
-addNumber("Jump delay (s)", "JumpDelay")
-addNumber("Jump velocity", "JumpVelocity")
-addNumber("P scale", "ShapeScale")
-addNumber("P width", "WidthScale")
-addNumber("Target at (0-1)", "TargetAt")
-addNumber("Reach radius", "ReachRadius")
-addNumber("Turn lerp", "TurnLerp")
-addNumber("Target range", "TargetRange")
-addNumber("Max time (s)", "MaxTime")
-addBool("Multi dash W-D-S", "MultiDash")
-addBool("Home after P", "HomeAfter")
-addBool("Noclip", "Noclip")
-addBool("Camera smooth", "CamSmooth")
-addBool("Require 3 M1", "RequireM1")
-addBool("Debug anim ids", "DebugAnimIds")
+local function corner(scale, offset)
+    return create("UICorner", {CornerRadius = UDim.new(scale, offset)})
+end
 
-toggleBtn.MouseButton1Click:Connect(function()
-    Config.Enabled = not Config.Enabled
-    if not Config.Enabled then stop(false) end
-    refreshToggle()
-end)
+local function stroke(transparency)
+    return create("UIStroke", {
+        Color = Theme.StrokeColor,
+        Transparency = transparency or Theme.StrokeTransparency,
+        Thickness = 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    })
+end
 
-gearBtn.MouseButton1Click:Connect(function()
-    panel.Visible = not panel.Visible
-end)
+local function glassGradient()
+    return create("UIGradient", {Color = ColorSequence.new(Theme.GlassTop, Theme.GlassBottom), Rotation = 60})
+end
 
-do
-    local dragging, dragStart, startPos
-    bind(header.InputBegan, function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging, dragStart, startPos = true, input.Position, main.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
+local function label(properties)
+    local merged = {
+        BackgroundTransparency = 1,
+        Font = Theme.Font,
+        TextSize = 14,
+        TextColor3 = Theme.Text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }
+    for name, value in pairs(properties) do
+        merged[name] = value
+    end
+    return create("TextLabel", merged)
+end
+
+local function animate(instance, goal, animated)
+    if animated then
+        TweenService:Create(instance, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), goal):Play()
+    else
+        for name, value in pairs(goal) do
+            instance[name] = value
+        end
+    end
+end
+
+local function snapshotStrokes(root)
+    local list = {}
+    for _, descendant in ipairs(root:GetDescendants()) do
+        if descendant:IsA("UIStroke") then
+            table.insert(list, {Stroke = descendant, Transparency = descendant.Transparency})
+        end
+    end
+    return list
+end
+
+local function fadeStrokes(list, progress)
+    local fade = math.clamp((progress - 0.55) / 0.45, 0, 1)
+    for _, entry in ipairs(list) do
+        entry.Stroke.Transparency = 1 - (1 - entry.Transparency) * fade
+    end
+end
+
+local function createAnimator(apply)
+    local value = Instance.new("NumberValue")
+    local connection = value.Changed:Connect(apply)
+    local tween
+    local animator = {}
+
+    function animator.Get()
+        return value.Value
+    end
+
+    function animator.Set(progress)
+        if tween then
+            tween:Cancel()
+            tween = nil
+        end
+        value.Value = progress
+        apply(progress)
+    end
+
+    function animator.To(goal, info, onDone)
+        if tween then
+            tween:Cancel()
+        end
+        local current = TweenService:Create(value, info, {Value = goal})
+        tween = current
+        current.Completed:Connect(function(state)
+            if tween == current then
+                tween = nil
+            end
+            if state == Enum.PlaybackState.Completed and onDone then
+                onDone()
+            end
+        end)
+        current:Play()
+    end
+
+    function animator.Destroy()
+        if tween then
+            tween:Cancel()
+        end
+        connection:Disconnect()
+        value:Destroy()
+    end
+
+    return animator
+end
+
+local function toHex(color)
+    return string.format(
+        "#%02X%02X%02X",
+        math.floor(color.R * 255 + 0.5),
+        math.floor(color.G * 255 + 0.5),
+        math.floor(color.B * 255 + 0.5)
+    )
+end
+
+local function isPress(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isSamePointer(input, active)
+    return input == active
+        or (active.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseButton1)
+end
+
+local function formatNumber(value)
+    return tostring(math.floor(value * 1000 + 0.5) / 1000)
+end
+
+local function mountGui(gui)
+    local resolvers = {}
+    if typeof(gethui) == "function" then
+        table.insert(resolvers, function()
+            return gethui()
+        end)
+    end
+    table.insert(resolvers, function()
+        return CoreGui
+    end)
+    table.insert(resolvers, function()
+        return player:WaitForChild("PlayerGui")
+    end)
+    for _, resolve in ipairs(resolvers) do
+        local ok = pcall(function()
+            gui.Parent = resolve()
+        end)
+        if ok and gui.Parent then
+            return
+        end
+    end
+end
+
+local function makeDraggable(handle, target, track)
+    local active, startPointer, startPosition
+
+    track(handle.InputBegan:Connect(function(input)
+        if not isPress(input) then
+            return
+        end
+        active = input
+        startPointer = input.Position
+        startPosition = target.Position
+    end))
+
+    track(UIS.InputChanged:Connect(function(input)
+        if not active then
+            return
+        end
+        if input ~= active and input.UserInputType ~= Enum.UserInputType.MouseMovement then
+            return
+        end
+        local delta = input.Position - startPointer
+        target.Position = UDim2.new(
+            startPosition.X.Scale, startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
+        )
+    end))
+
+    track(UIS.InputEnded:Connect(function(input)
+        if active and isSamePointer(input, active) then
+            active = nil
+        end
+    end))
+end
+
+local function buildToggle(row, options, track)
+    local callback = options.Callback or function() end
+    local state = options.Default == true
+    local description = options.Description
+
+    label({
+        Size = UDim2.new(1, -64, 0, description and 22 or 40),
+        Position = UDim2.fromOffset(12, description and 6 or 0),
+        Text = options.Name,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Parent = row,
+    })
+    if description then
+        label({
+            Size = UDim2.new(1, -64, 0, 14),
+            Position = UDim2.fromOffset(12, 28),
+            Text = description,
+            TextSize = 11,
+            TextColor3 = Theme.TextMuted,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            Parent = row,
+        })
+    end
+    local switch = create("Frame", {
+        Size = UDim2.fromOffset(38, 20),
+        Position = UDim2.new(1, -50, 0.5, -10),
+        BackgroundColor3 = Theme.SwitchOff,
+        BorderSizePixel = 0,
+        Parent = row,
+    }, {corner(1, 0)})
+    local knob = create("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        Position = UDim2.fromOffset(3, 3),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        Parent = switch,
+    }, {corner(1, 0)})
+    local hit = create("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", Parent = row})
+
+    local function render(animated)
+        animate(switch, {BackgroundColor3 = state and Theme.Accent or Theme.SwitchOff}, animated)
+        animate(knob, {Position = state and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3)}, animated)
+    end
+    render(false)
+
+    local control = {}
+    function control:Get()
+        return state
+    end
+    function control:Set(value)
+        state = value == true
+        render(true)
+        task.spawn(callback, state)
+    end
+    track(hit.Activated:Connect(function()
+        control:Set(not state)
+    end))
+    return control
+end
+
+local function newRow(page, height)
+    page.Order = page.Order + 1
+    return create("Frame", {
+        Size = UDim2.new(1, 0, 0, height),
+        BackgroundColor3 = Theme.RowColor,
+        BackgroundTransparency = Theme.RowTransparency,
+        BorderSizePixel = 0,
+        LayoutOrder = page.Order,
+        Parent = page.Scroll,
+    }, {corner(0, Theme.RowCorner)})
+end
+
+function Page:AddToggle(options)
+    local row = newRow(self, options.Description and 48 or 40)
+    return buildToggle(row, options, self.Track)
+end
+
+function Page:AddNumber(options)
+    local callback = options.Callback or function() end
+    local value = options.Default or 0
+    local row = newRow(self, 40)
+
+    label({
+        Size = UDim2.new(1, -112, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        Text = options.Name,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Parent = row,
+    })
+
+    local boxStroke = stroke(0.85)
+    local box = create("TextBox", {
+        Size = UDim2.fromOffset(84, 26),
+        Position = UDim2.new(1, -96, 0.5, -13),
+        BackgroundColor3 = Theme.RowColor,
+        BackgroundTransparency = Theme.RowTransparency,
+        BorderSizePixel = 0,
+        ClearTextOnFocus = false,
+        Font = Theme.Font,
+        Text = formatNumber(value),
+        TextSize = 13,
+        TextColor3 = Theme.Text,
+        PlaceholderColor3 = Theme.TextMuted,
+        Parent = row,
+    }, {corner(0, Theme.RowCorner), boxStroke})
+
+    self.Track(box.Focused:Connect(function()
+        animate(boxStroke, {Color = Theme.Accent, Transparency = 0.3}, true)
+    end))
+    self.Track(box.FocusLost:Connect(function()
+        animate(boxStroke, {Color = Theme.StrokeColor, Transparency = 0.85}, true)
+        local n = tonumber(box.Text)
+        if n and n == n and math.abs(n) ~= math.huge then
+            value = n
+            task.spawn(callback, value)
+        end
+        box.Text = formatNumber(value)
+    end))
+
+    local control = {Box = box}
+    function control:Get()
+        return value
+    end
+    function control:Set(newValue)
+        value = newValue
+        box.Text = formatNumber(value)
+        task.spawn(callback, value)
+    end
+    return control
+end
+
+function Page:AddSection(title)
+    self.Order = self.Order + 1
+    local section = label({
+        Size = UDim2.new(1, 0, 0, 22),
+        Text = string.upper(title),
+        Font = Theme.FontBold,
+        TextSize = 11,
+        TextColor3 = Theme.Accent,
+        LayoutOrder = self.Order,
+        Parent = self.Scroll,
+    })
+    create("UIPadding", {PaddingLeft = UDim.new(0, 4), Parent = section})
+end
+
+function Page:AddLabel(options)
+    local row = newRow(self, 32)
+    local text = label({
+        Size = UDim2.new(1, -24, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        Text = options.Text,
+        TextSize = 12,
+        TextColor3 = Theme.TextMuted,
+        TextWrapped = true,
+        Parent = row,
+    })
+
+    local control = {Label = text}
+    function control:SetText(value)
+        text.Text = value
+    end
+    return control
+end
+
+function Page:AddButton(options)
+    local callback = options.Callback or function() end
+    local danger = options.Danger == true
+    self.Order = self.Order + 1
+    local button = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 38),
+        BackgroundColor3 = danger and Theme.Danger or Theme.Accent,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Font = Theme.Font,
+        Text = options.Name,
+        TextSize = 14,
+        TextColor3 = danger and Theme.OnDanger or Theme.OnAccent,
+        LayoutOrder = self.Order,
+        Parent = self.Scroll,
+    }, {corner(0, Theme.RowCorner)})
+
+    local function release()
+        animate(button, {BackgroundTransparency = 0}, true)
+    end
+    self.Track(button.MouseButton1Down:Connect(function()
+        animate(button, {BackgroundTransparency = 0.25}, true)
+    end))
+    self.Track(button.MouseButton1Up:Connect(release))
+    self.Track(button.MouseLeave:Connect(release))
+    self.Track(button.Activated:Connect(function()
+        task.spawn(callback)
+    end))
+
+    local control = {Button = button}
+    function control:SetText(text)
+        button.Text = text
+    end
+    return control
+end
+
+function GlassUI.new(options)
+    options = options or {}
+    local title = options.Title or "GlassUI"
+    local subtitle = options.Subtitle
+    local onClose = options.OnClose
+
+    local connections = {}
+    local function track(connection)
+        table.insert(connections, connection)
+        return connection
+    end
+
+    local gui = create("ScreenGui", {
+        Name = "SolitudeTechUI",
+        ResetOnSpawn = false,
+        IgnoreGuiInset = true,
+        DisplayOrder = 999,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    })
+    mountGui(gui)
+
+    local windowScale = create("UIScale", {Scale = 1})
+    local window = create("Frame", {
+        Name = "Window",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(0.9, 0.85),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = Theme.WindowTransparency,
+        BorderSizePixel = 0,
+        Visible = false,
+        Parent = gui,
+    }, {
+        corner(0, Theme.Corner),
+        stroke(),
+        create("UISizeConstraint", {MinSize = Vector2.new(260, 180), MaxSize = Vector2.new(Theme.WindowMaxWidth, Theme.WindowMaxHeight)}),
+        glassGradient(),
+        windowScale,
+    })
+
+    local sidebar = create("Frame", {
+        Name = "Sidebar",
+        Position = UDim2.fromOffset(8, 8),
+        Size = UDim2.new(0, 48, 1, -16),
+        BackgroundColor3 = Theme.SidebarColor,
+        BackgroundTransparency = Theme.SidebarTransparency,
+        BorderSizePixel = 0,
+        Parent = window,
+    }, {corner(0, 10), stroke(0.85)})
+
+    local tabList = create("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Parent = sidebar}, {
+        create("UIListLayout", {
+            Padding = UDim.new(0, 6),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        }),
+        create("UIPadding", {PaddingTop = UDim.new(0, 6)}),
+    })
+
+    local content = create("Frame", {
+        Name = "Content",
+        Position = UDim2.fromOffset(64, 0),
+        Size = UDim2.new(1, -72, 1, 0),
+        BackgroundTransparency = 1,
+        Parent = window,
+    })
+    local titleBar = create("Frame", {Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1, Parent = content})
+    local titleLabel = label({
+        Size = UDim2.new(1, -84, 0, subtitle and 22 or 40),
+        Position = UDim2.fromOffset(4, subtitle and 2 or 0),
+        Text = title,
+        TextSize = 15,
+        RichText = true,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        Parent = titleBar,
+    })
+    if subtitle then
+        label({
+            Size = UDim2.new(1, -84, 0, 14),
+            Position = UDim2.fromOffset(4, 24),
+            Text = subtitle,
+            TextSize = 11,
+            TextColor3 = Theme.TextMuted,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            Parent = titleBar,
+        })
+    end
+    local minimizeButton = create("TextButton", {
+        Size = UDim2.fromOffset(36, 36),
+        Position = UDim2.new(1, -72, 0, 2),
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        Text = "",
+        Parent = titleBar,
+    }, {
+        create("Frame", {
+            Size = UDim2.fromOffset(12, 2),
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            BackgroundColor3 = Theme.TextMuted,
+            BorderSizePixel = 0,
+        }, {corner(1, 0)}),
+    })
+    local closeButton = create("TextButton", {
+        Size = UDim2.fromOffset(32, 32),
+        Position = UDim2.new(1, -34, 0, 4),
+        BackgroundColor3 = Theme.Danger,
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        Font = Theme.Font,
+        Text = "\u{D7}",
+        TextSize = 22,
+        TextColor3 = Theme.TextMuted,
+        Parent = titleBar,
+    }, {corner(0, Theme.RowCorner)})
+    create("Frame", {
+        Position = UDim2.fromOffset(0, 40),
+        Size = UDim2.new(1, 0, 0, 1),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BackgroundTransparency = 0.85,
+        BorderSizePixel = 0,
+        Parent = content,
+    })
+    local pages = create("Frame", {
+        Position = UDim2.fromOffset(0, 48),
+        Size = UDim2.new(1, 0, 1, -56),
+        BackgroundTransparency = 1,
+        Parent = content,
+    })
+
+    local edgeHint = create("Frame", {
+        Name = "EdgeHint",
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 2, 0.5, 0),
+        Size = UDim2.fromOffset(Theme.StickWidth, 48),
+        BackgroundColor3 = Theme.Accent,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        Parent = gui,
+    }, {corner(1, 0)})
+
+    local restPosition = window.Position
+    local shown = false
+    local stickPosition = UDim2.new(0, 2 + Theme.StickWidth / 2, 0.5, 0)
+    local windowStrokes = snapshotStrokes(window)
+    local animator = createAnimator(function(progress)
+        windowScale.Scale = SeedScale + (1 - SeedScale) * progress
+        window.Position = stickPosition:Lerp(restPosition, progress)
+        fadeStrokes(windowStrokes, progress)
+    end)
+
+    local self = {Gui = gui, Window = window, CloseButton = closeButton, Track = track}
+    local tabs = {}
+    local visibilityCallbacks = {}
+
+    local function selectTab(tab)
+        for _, other in ipairs(tabs) do
+            local selected = other == tab
+            other.Scroll.Visible = selected
+            animate(other.Button, {BackgroundTransparency = selected and 0.78 or 1}, true)
+            animate(other.Glyph, {[other.ColorProperty] = selected and Theme.Accent or Theme.TextMuted}, true)
+        end
+        titleLabel.Text = string.format('%s <font color="%s">/ %s</font>', title, toHex(Theme.TextMuted), tab.Name)
+    end
+
+    function self:OnVisibility(callback)
+        table.insert(visibilityCallbacks, callback)
+    end
+
+    function self:SetVisible(visible)
+        if visible == shown then
+            return
+        end
+        shown = visible
+
+        if visible then
+            if not window.Visible then
+                animator.Set(0)
+                window.Visible = true
+            end
+            animator.To(1, WindowShowTween)
+            animate(edgeHint, {BackgroundTransparency = 1}, false)
+        else
+            if animator.Get() >= 1 then
+                restPosition = window.Position
+            end
+            animator.To(0, WindowHideTween, function()
+                window.Visible = false
+                animate(edgeHint, {BackgroundTransparency = 0.45}, true)
             end)
         end
-    end)
-    bind(UIS.InputChanged, function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            local d = input.Position - dragStart
-            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+
+        for _, callback in ipairs(visibilityCallbacks) do
+            task.spawn(callback, visible)
         end
-    end)
+    end
+
+    function self:AddTab(tabOptions)
+        local name = tabOptions.Name
+        local icon = tabOptions.Icon or string.sub(name, 1, 1)
+
+        local button = create("TextButton", {
+            Size = UDim2.fromOffset(36, 36),
+            BackgroundColor3 = Theme.Accent,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            AutoButtonColor = false,
+            Text = "",
+            LayoutOrder = #tabs + 1,
+            Parent = tabList,
+        }, {corner(0, Theme.RowCorner)})
+
+        local glyph, colorProperty
+        if string.sub(icon, 1, 13) == "rbxassetid://" then
+            colorProperty = "ImageColor3"
+            glyph = create("ImageLabel", {
+                Size = UDim2.fromOffset(20, 20),
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                Position = UDim2.fromScale(0.5, 0.5),
+                BackgroundTransparency = 1,
+                Image = icon,
+                ImageColor3 = Theme.TextMuted,
+                Parent = button,
+            })
+        else
+            colorProperty = "TextColor3"
+            glyph = label({
+                Size = UDim2.fromScale(1, 1),
+                Text = icon,
+                TextSize = 16,
+                TextXAlignment = Enum.TextXAlignment.Center,
+                TextColor3 = Theme.TextMuted,
+                Parent = button,
+            })
+        end
+
+        local scroll = create("ScrollingFrame", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ScrollBarThickness = 3,
+            ScrollBarImageColor3 = Theme.Accent,
+            AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            CanvasSize = UDim2.new(),
+            Visible = false,
+            Parent = pages,
+        }, {
+            create("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}),
+            create("UIPadding", {PaddingRight = UDim.new(0, 6)}),
+        })
+
+        local tab = {Name = name, Button = button, Glyph = glyph, ColorProperty = colorProperty, Scroll = scroll}
+        table.insert(tabs, tab)
+        track(button.Activated:Connect(function()
+            selectTab(tab)
+        end))
+        if #tabs == 1 then
+            selectTab(tab)
+        end
+        return setmetatable({Scroll = scroll, Order = 0, Track = track}, Page)
+    end
+
+    function self:Destroy()
+        for _, connection in ipairs(connections) do
+            connection:Disconnect()
+        end
+        table.clear(connections)
+        animator.Destroy()
+        gui:Destroy()
+    end
+
+    track(minimizeButton.Activated:Connect(function()
+        self:SetVisible(false)
+    end))
+    track(closeButton.Activated:Connect(function()
+        if onClose then
+            onClose()
+        else
+            self:SetVisible(false)
+        end
+    end))
+    makeDraggable(titleBar, window, track)
+
+    local swipeInput, swipeOrigin
+    track(UIS.InputBegan:Connect(function(input)
+        if shown then
+            return
+        end
+        if input.UserInputType ~= Enum.UserInputType.Touch and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+            return
+        end
+        if input.Position.X <= Theme.SwipeEdgeWidth then
+            swipeInput = input
+            swipeOrigin = input.Position
+        end
+    end))
+    track(UIS.InputChanged:Connect(function(input)
+        if not swipeInput or shown then
+            return
+        end
+        local isMouseDrag = swipeInput.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseMovement
+        if input ~= swipeInput and not isMouseDrag then
+            return
+        end
+        local delta = input.Position - swipeOrigin
+        if delta.X >= Theme.SwipeDistance and math.abs(delta.Y) <= delta.X * 0.75 then
+            swipeInput = nil
+            self:SetVisible(true)
+        elseif math.abs(delta.Y) > 40 and math.abs(delta.Y) > delta.X then
+            swipeInput = nil
+        end
+    end))
+    track(UIS.InputEnded:Connect(function(input)
+        if swipeInput and isSamePointer(input, swipeInput) then
+            swipeInput = nil
+        end
+    end))
+    track(UIS.InputBegan:Connect(function(input, processed)
+        if not processed and input.KeyCode == Theme.ToggleKey then
+            self:SetVisible(not shown)
+        end
+    end))
+
+    self:SetVisible(true)
+    return self
+end
+
+-- ============================================================
+-- Menu content
+-- ============================================================
+
+local confirming = false
+local confirmToken = 0
+local requestUnload
+
+local window = GlassUI.new({
+    Title = "Solitude Tech",
+    Subtitle = "made by " .. Theme.Author,
+    OnClose = function()
+        requestUnload()
+    end,
+})
+
+local controls = {}
+local numberBoxes = {}
+
+local function addToggle(page, name, key, description, onChange)
+    local control = page:AddToggle({
+        Name = name,
+        Description = description,
+        Default = Config[key],
+        Callback = function(enabled)
+            Config[key] = enabled
+            if onChange then
+                onChange(enabled)
+            end
+        end,
+    })
+    controls[#controls + 1] = {Key = key, Control = control}
+end
+
+local function addNumber(page, name, key)
+    local control = page:AddNumber({
+        Name = name,
+        Default = Config[key],
+        Callback = function(value)
+            Config[key] = value
+        end,
+    })
+    controls[#controls + 1] = {Key = key, Control = control}
+    numberBoxes[#numberBoxes + 1] = control.Box
+end
+
+window:OnVisibility(function(visible)
+    if not visible then
+        for _, box in ipairs(numberBoxes) do
+            box:ReleaseFocus()
+        end
+    end
+end)
+
+local main = window:AddTab({Name = "Main"})
+main:AddSection("Tech")
+addToggle(main, "Enabled", "Enabled", "Auto-dash after uppercut", function(enabled)
+    if not enabled then
+        stop(false)
+    end
+end)
+addToggle(main, "Require 3 M1", "RequireM1", "Only after three M1 hits")
+addToggle(main, "Multi dash W-D-S", "MultiDash", "Dash on every P segment")
+addToggle(main, "Home after P", "HomeAfter", "Chase the target after the P")
+main:AddSection("Movement")
+addToggle(main, "Height lock", "HeightLock", "Hold height at the target torso")
+addToggle(main, "Noclip", "Noclip", "Pass through nearby players")
+addToggle(main, "Camera smooth", "CamSmooth", "Attach the camera during the dash")
+main:AddSection("Debug")
+addToggle(main, "Debug anim ids", "DebugAnimIds", "Print animation ids to the console")
+
+local tuning = window:AddTab({Name = "Tuning", Icon = "T"})
+tuning:AddSection("Timing")
+addNumber(tuning, "Jump delay (s)", "JumpDelay")
+addNumber(tuning, "Jump velocity", "JumpVelocity")
+addNumber(tuning, "Max time (s)", "MaxTime")
+tuning:AddSection("Height")
+addNumber(tuning, "Height offset", "HeightOffset")
+addNumber(tuning, "Height lerp", "HeightLerp")
+tuning:AddSection("P shape")
+addNumber(tuning, "P scale", "ShapeScale")
+addNumber(tuning, "P width", "WidthScale")
+addNumber(tuning, "Target at (0-1)", "TargetAt")
+addNumber(tuning, "Reach radius", "ReachRadius")
+addNumber(tuning, "Turn lerp", "TurnLerp")
+tuning:AddSection("Targeting")
+addNumber(tuning, "Target range", "TargetRange")
+
+local function resetToDefaults()
+    for _, entry in ipairs(controls) do
+        local default = Defaults[entry.Key]
+        if entry.Control:Get() ~= default then
+            entry.Control:Set(default)
+        end
+    end
+end
+
+local settingsPage = window:AddTab({Name = "Settings"})
+settingsPage:AddLabel({Text = "Solitude Tech  \u{B7}  by " .. Theme.Author})
+settingsPage:AddLabel({Text = "Open: swipe right from the left screen edge"})
+settingsPage:AddLabel({Text = "PC: RightShift shows or hides the menu"})
+settingsPage:AddButton({Name = "Hide menu", Callback = function()
+    window:SetVisible(false)
+end})
+settingsPage:AddButton({Name = "Reset to defaults", Callback = resetToDefaults})
+local unloadControl = settingsPage:AddButton({Name = "Unload", Danger = true, Callback = function()
+    requestUnload()
+end})
+
+local toast = create("Frame", {
+    Name = "ConfirmToast",
+    AnchorPoint = Vector2.new(0.5, 1),
+    Position = ToastHidden,
+    Size = UDim2.fromOffset(0, 48),
+    AutomaticSize = Enum.AutomaticSize.X,
+    BackgroundColor3 = Theme.GlassBottom,
+    BackgroundTransparency = 0.12,
+    BorderSizePixel = 0,
+    ZIndex = 10,
+    Parent = window.Gui,
+}, {
+    corner(0, 10),
+    create("UIStroke", {Color = Theme.Danger, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}),
+    create("UIPadding", {
+        PaddingLeft = UDim.new(0, 14),
+        PaddingRight = UDim.new(0, 14),
+        PaddingTop = UDim.new(0, 8),
+    }),
+    create("UIListLayout", {Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder}),
+    label({
+        Size = UDim2.fromOffset(0, 16),
+        AutomaticSize = Enum.AutomaticSize.X,
+        Text = ConfirmText,
+        TextSize = 13,
+        LayoutOrder = 1,
+    }),
+    label({
+        Size = UDim2.fromOffset(0, 14),
+        AutomaticSize = Enum.AutomaticSize.X,
+        Text = ConfirmHint,
+        TextSize = 11,
+        TextColor3 = Theme.TextMuted,
+        LayoutOrder = 2,
+    }),
+})
+
+local function setArmed(state)
+    if destroyed then
+        return
+    end
+    confirming = state
+    animate(window.CloseButton, {
+        BackgroundTransparency = state and 0 or 1,
+        TextColor3 = state and Theme.OnDanger or Theme.TextMuted,
+    }, true)
+    animate(toast, {Position = state and ToastShown or ToastHidden}, true)
+    unloadControl:SetText(state and "Press again to confirm" or "Unload")
 end
 
 local function destroy()
+    if destroyed then
+        return
+    end
     destroyed = true
     stop(false)
     if animConn then animConn:Disconnect() animConn = nil end
     if diedConn then diedConn:Disconnect() diedConn = nil end
     for _, c in ipairs(conns) do c:Disconnect() end
     table.clear(conns)
-    if gui then gui:Destroy() end
-    getgenv().SolitudeTech = nil
+    window:Destroy()
+    env.SolitudeTech = nil
 end
 
-closeBtn.MouseButton1Click:Connect(destroy)
-getgenv().SolitudeTech = {destroy = destroy}
+requestUnload = function()
+    confirmToken = confirmToken + 1
+    if confirming then
+        task.spawn(destroy)
+        return
+    end
+
+    setArmed(true)
+    local token = confirmToken
+    task.delay(ConfirmTimeout, function()
+        if token == confirmToken and confirming then
+            setArmed(false)
+        end
+    end)
+end
+
+env.SolitudeTech = {destroy = destroy}
