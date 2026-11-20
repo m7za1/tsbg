@@ -20,7 +20,8 @@ local config = {
     voidDistance = -10000,
     platformSize = Vector3.new(10, 1, 10),
     returnDelay = 6,
-}
+  }
+
 getgenv().antiDeathCounterClean = config
 
 local state = {
